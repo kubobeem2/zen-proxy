@@ -232,9 +232,9 @@ zen-proxy はこの窓を状態として持ちます:
 | `syncProbeModels` / `syncIdleMs` | `1` / `120000` | 同期でプローブするモデル数（`0` で全件）と、実リクエストからこの時間は同期を走らせない間隔 |
 | `freeTierFastFail` | `true` | `FreeUsageLimitError` / `FreeTierError` を「モデルの失敗」ではなく「アカウントと出口の判定」として扱い、カタログを歩かず即返す |
 | `trustForwarded` | `false` | リバースプロキシ配下で `x-forwarded-for` を信頼する |
-| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "fallback": "direct", "mode": "auto", "cooldownMs": 300000 }` | 2つ目の出口（HTTP CONNECT プロキシ。Cloudflare WARP のプロキシモードなど）。`mode` は `auto`（direct から始めて拒否されたら切替）/ `always`（固定）/ `off`。`cooldownMs` は拒否した経路を避ける時間。[WARP](#warp) を参照 |
+| `warpProxy` | `{ "enabled": false, "port": 8890, "hop": "", "hops": [], "fallback": "direct", "mode": "auto", "cooldownMs": 60000, "rotateCommand": "warp-cli --accept-tos disconnect && warp-cli --accept-tos connect", "rotateCooldownMs": 60000, "rotateTimeoutMs": 90000, "autoRotateOnEgressReject": false }` | 2つ目の出口（HTTP CONNECT プロキシ。Cloudflare WARP のプロキシモードなど）。`mode` は `auto`（direct から始めて拒否されたら切替）/ `always`（固定）/ `warp-only`（固定＋directへは絶対に落ちない）/ `off`。`hops` は複数ホップ（ラウンドロビン）。`rotateCommand` / `rotateCooldownMs` / `rotateTimeoutMs` は出口IPの取り直し用。`autoRotateOnEgressReject` は既定オフの自動取り直し。[WARP](#warp) を参照 |
 
-`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `SYNC_PROBE_MODELS` `SYNC_IDLE_MS` `FREE_TIER_FAST_FAIL=0` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_FALLBACK` `WARP_PROXY_MODE` `WARP_PROXY_COOLDOWN_MS` `ZEN_PROXY_CONFIG`
+`HOST` `PORT` `ZEN_URL` `ZEN_UA` `ZEN_CLIENT` `ZEN_PROJECT_HASH` `ZEN_TRACING=0` `INJECT_SESSION=0` `AUTO_UA=0` `UA_REFRESH_MS` `AGENT_TOOLS=0` `AGENT_PREAMBLE=off` `ZEN_PROXY_AGENT_TOOLS` `ZEN_PROXY_AGENT_PREAMBLE` `PROBE_AUTH` `DEFAULT_MODEL` `FALLBACK_MODELS` `MODEL_ALIASES` `RESPONSES_MODELS` `PROXY_KEY` `ZEN_KEY` `ZEN_KEYS` `ZEN_KEYS_FILE` `ZEN_KEYS_REFS` `TRUST_FORWARDED=1` `TIMEOUT_MS` `CACHE_MS` `RATE_LIMIT_MAX` `RATE_LIMIT_WINDOW_MS` `AUTO_SYNC=0` `AUTO_SYNC_MS` `SYNC_PROBE_MODELS` `SYNC_IDLE_MS` `FREE_TIER_FAST_FAIL=0` `WARP_PROXY_ENABLED=0` `WARP_PROXY_PORT` `WARP_PROXY_HOP` `WARP_PROXY_HOPS` `WARP_PROXY_FALLBACK` `WARP_PROXY_MODE` `WARP_PROXY_COOLDOWN_MS` `WARP_PROXY_ROTATE_COMMAND` `WARP_PROXY_ROTATE_COOLDOWN_MS` `WARP_PROXY_ROTATE_TIMEOUT_MS` `WARP_PROXY_AUTO_ROTATE_ON_EGRESS_REJECT=1` `ZEN_PROXY_CONFIG`
 
 匿名の `public` アクセスは IP 単位の枠を共有していて、混雑することがあります。安定させたいなら `defaultZenKey` を設定するか、リクエスト毎に `x-zen-key` を送ってください。複数アカウント（`zenKeys`、または `zenKeysFile` の refs）を設定すると順番に使われるので、1アカウントあたりの枠が上限ではなくなります。`/api/status` にプールと各アカウントの利用数（マスク済み）が出ます。
 </details>
@@ -260,7 +260,8 @@ zen-proxy はこの窓を状態として持ちます:
 | `GET` | `/health` | ヘルスチェック（常に開いています） |
 | `GET` | `/` | ダッシュボード |
 | `GET`/`PUT` | `/api/config` | 設定の読み書き |
-| `GET` | `/api/status` | 統計と上流の状態 |
+| `GET` | `/api/status` | 統計と上流の状態。`?refresh=1` で出口IPをホップ経由で測り直す |
+| `POST` | `/api/warp/rotate` | WARPの出口IPを取り直す（localhostのみ。`proxyKey` 設定時は認証も要る）。[WARP](#warp) を参照 |
 | `POST` | `/api/test` | モデルを1つ試す — `{"model":"..."}` |
 | `GET` | `/api/logs` | ログの末尾 |
 | `POST` | `/api/sync` | モデルディスカバリをやり直す |
@@ -314,12 +315,14 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc      # 永続化
 
 - `warpProxy.mode: "auto"`（既定）— direct から始め、`FreeUsageLimitError` / `FreeTierError` が返ったら同じリクエストをもう一方の経路で1回だけ試します。通った方を `warpProxy.cooldownMs`（既定5分）のあいだ使い続け、拒否された方はその間避けます。
 - `warpProxy.mode: "always"` — WARP に固定（従来の動き）。
+- `warpProxy.mode: "warp-only"` — WARP に固定し、**direct へは絶対に落ちません**。ホップが死んでいたらリクエストは 502/503 で失敗します（素のIPは漏れない）。リレーを `--fallback none` で動かすことが条件で、そうでないリレーでは推論リクエスト自体が 503 になります。ホスト全体のルーティングは変わりません——WARP を通るのはこのプロキシの上流通信だけです。
 - `warpProxy.mode: "off"` — direct のみ。
 
 ホップは HTTP CONNECT プロキシです。Cloudflare WARP のプロキシモードは `127.0.0.1:40000` で喋り、他の CONNECT プロキシも同じです。そこへは小さな中継 `scripts/warp-relay.mjs` を介します。中継はトンネルをホップ経由で開き、ホップに届かなければ直接ソケットに切り替えるので、WARP が止まってもプロキシは使えます。
 
 ```bash
 sudo bash deploy/install-warp.sh          # WARP + 中継ユニット + zen-proxy の drop-in
+sudo WARP_ONLY=1 bash deploy/install-warp.sh  # fail-closed (warp-only) で入れる
 curl -s http://127.0.0.1:8890/__status    # トンネル数、ホップ経由か直接か
 curl -s http://127.0.0.1:8787/api/status  # egress: いまどちらの経路か、どちらが拒否中か
 ```
@@ -342,6 +345,7 @@ curl -s http://127.0.0.1:8787/api/status  # egress: いまどちらの経路か�
 |---|---|
 | `auto`（既定） | direct から始め、**出口固有**の失敗（403 `FreeTierError`、接続失敗）のときだけ WARP へ切り替え |
 | `always` | WARP 固定 |
+| `warp-only` | WARP 固定＋directへは絶対に落ちない（fail closed。リレーは `--fallback none` が要る） |
 | `off` | WARP を使わない（direct のみ。起動ログは `egress: direct only (hop disabled)`） |
 
 ```bash
@@ -359,6 +363,34 @@ curl -s -X PUT http://127.0.0.1:8787/api/config \
 ```
 
 ダッシュボードの「Upstream egress」からも同じ切り替えができます。`/api/status` の `egress` に `mode` / `active` / `healthy` が出ます。
+
+### 複数ホップ
+
+`warpProxy.hops` に CONNECT プロキシを並べると、リレーがトンネル毎にラウンドロビンします。CONNECT を拒否したホップは `cooldownMs` のあいだ避けられ、残りが回り続けます。未設定時は従来の単一ホップ（`warpProxy.hop`）のままです。ホップ毎の状態は `/api/status` の `warp.hops`（`healthy` / `avoidForSec` / `viaHop`）に出ます。
+
+```bash
+# 2つ目の warp-cli インスタンスを別ポートのプロキシモードで用意してから
+sudo WARP_PROXY_HOPS="http://127.0.0.1:40000,http://127.0.0.1:40001" bash deploy/install-warp.sh
+```
+
+2つ目のインスタンスは `warp-cli` の2つ目の登録（別ポートで `mode proxy`）が必要です。スクリプトは自動では作りません——1インスタンス＝1出口が WARP の単位なので、増やすときはそのインスタンス側で `warp-cli --accept-tos connect` まで済ませておいてください。
+
+### 出口IPの取り直し（rotate）
+
+WARP の出口IPそのものが拒否されたとき（403 `FreeTierError`）、WARP セッションを作り直すと別の出口IPになることがあります。`warp-cli disconnect && warp-cli connect` を回すだけの軽い操作で、ホストのルーティングには触れません。
+
+```bash
+# いまの出口IPを確認する（ホップ経由で測る。毎リクエストは測らない）
+curl -s "http://127.0.0.1:8787/api/status?refresh=1" | python3 -c "import json,sys; print(json.load(sys.stdin)['egress'])"
+
+# 出口IPを取り直す（localhostからのみ。proxyKey 設定時は -H "Authorization: Bearer <key>" も要る）
+curl -s -X POST http://127.0.0.1:8787/api/warp/rotate
+# {"ok":true,"ipBefore":"203.0.113.42","ipAfter":"198.51.100.7","changed":true,"at":"..."}
+```
+
+実行中は 409、クールダウン中（既定60秒・完了時刻から測る）は 429（`retryAfterSec` 付き）になります。取り直すコマンドは `warpProxy.rotateCommand` で変えられます（設定ファイルの値だけが使われ、リクエストでコマンドは指定できません）。
+
+**自動の取り直しは既定オフです。** `warpProxy.autoRotateOnEgressReject: true` のときだけ、出口固有の拒否（403 `FreeTierError`・接続失敗）で1回だけ自動で取り直します。**`retry-after` 付きの429では絶対に取り直しません。** あれはゲートウェイ共有の無料プールの「窓」で、出口IPを変えても残り時間は変わらないからです（[無料枠の「窓」と残量](#無料枠の窓と残量)）。窓が閉じているあいだ rotate を回しても、開くのは早くなりません。
 
 元に戻す:
 

@@ -130,6 +130,73 @@ describe("warp-relay", () => {
     await local.close()
   })
 
+  test("round-robins several hops and skips a dead one during its cooldown", async () => {
+    const target = await startTarget("through hop two")
+    const hop1 = await startFakeHop()
+    const hop2 = await startFakeHop()
+    closers.push(
+      () => new Promise((r) => hop1.server.close(r)),
+      () => new Promise((r) => hop2.server.close(r)),
+      () => new Promise((r) => target.server.close(r)),
+    )
+    const relay = createRelay({
+      listenPort: 0,
+      hops: [`http://127.0.0.1:${hop1.port}`, `http://127.0.0.1:${hop2.port}`],
+      fallback: "direct",
+      hopCooldownMs: 60_000,
+    })
+    const addr = await relay.listen()
+    closers.push(() => relay.close())
+
+    // Two tunnels in a row use the two hops in turn.
+    await tunnelRequest(addr.port, "127.0.0.1", target.port)
+    await tunnelRequest(addr.port, "127.0.0.1", target.port)
+    const status = JSON.parse(
+      await new Promise((resolve, reject) => {
+        http
+          .get({ host: "127.0.0.1", port: addr.port, path: "/__status" }, (res) => {
+            const chunks = []
+            res.on("data", (c) => chunks.push(c))
+            res.on("end", () => resolve(Buffer.concat(chunks).toString()))
+          })
+          .on("error", reject)
+      }),
+    )
+    assert.equal(status.hops.length, 2)
+    assert.equal(status.hops[0].viaHop, 1)
+    assert.equal(status.hops[1].viaHop, 1)
+    assert.equal(status.hops[0].healthy, true)
+
+    // Kill the first hop: the next tunnels all go through the second one
+    // while the first sits out its cooldown (no direct leak, no 502).
+    await new Promise((r) => hop1.server.close(r))
+    const before = status.hops[1].viaHop
+    await tunnelRequest(addr.port, "127.0.0.1", target.port)
+    await tunnelRequest(addr.port, "127.0.0.1", target.port)
+    assert.equal(relay.stats.hops[1].viaHop, before + 2)
+    assert.equal(relay.stats.hops[0].healthy, false)
+    assert.ok(relay.stats.hops[0].avoidForSec > 0)
+    assert.equal(relay.stats.viaDirect, 0)
+  })
+
+  test("answers 502 when every hop is dead and the fallback is off", async () => {
+    const dead1 = await closedPort()
+    const dead2 = await closedPort()
+    const local = createRelay({
+      listenPort: 0,
+      hops: [`http://127.0.0.1:${dead1}`, `http://127.0.0.1:${dead2}`],
+      fallback: "none",
+      hopCooldownMs: 60_000,
+    })
+    const addr = await local.listen()
+    const res = await tunnelRequest(addr.port, "127.0.0.1", 9)
+    assert.equal(res.status, 502)
+    assert.equal(local.stats.failed, 1)
+    assert.equal(local.stats.hops[0].failures, 1)
+    assert.equal(local.stats.hops[1].failures, 1)
+    await local.close()
+  })
+
   test("reports its counters on /__status and refuses other plain requests", async () => {
     const local = createRelay({ listenPort: 0, hop: "", fallback: "direct" })
     const addr = await local.listen()

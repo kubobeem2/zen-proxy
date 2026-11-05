@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 import http from "node:http"
 import fs from "node:fs"
+import net from "node:net"
+import tls from "node:tls"
 import path from "node:path"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 import { randomBytes, createHash } from "node:crypto"
 import { fileURLToPath } from "node:url"
 
@@ -339,21 +343,40 @@ const DEFAULT_CONFIG = {
   zenKeysFile: String(ENV.ZEN_KEYS_FILE ?? "").trim(),
   zenKeysRefs: parseList(ENV.ZEN_KEYS_REFS ?? ""),
   // A proxy hop (Cloudflare WARP in proxy mode, or any HTTP CONNECT proxy) in
-  // front of every upstream call. The relay that opens the tunnels runs inside
-  // this process, so a stopped hop falls back to a direct socket instead of
-  // taking the upstream down with it.
+  // front of every upstream call. The relay that opens the tunnels runs as its
+  // own unit (scripts/warp-relay.mjs), so a stopped hop falls back to a direct
+  // socket instead of taking the upstream down with it — unless the mode is
+  // `warp-only`, where a dead hop fails closed instead.
   warpProxy: {
-    enabled: ENV.WARP_PROXY_ENABLED !== "0" && Boolean(ENV.WARP_PROXY_HOP),
+    enabled: ENV.WARP_PROXY_ENABLED !== "0" && Boolean(ENV.WARP_PROXY_HOP || ENV.WARP_PROXY_HOPS),
     port: Number(ENV.WARP_PROXY_PORT ?? 8890),
     hop: String(ENV.WARP_PROXY_HOP ?? "").trim(),
+    // Extra hops, same form as `hop` ("host:port" or a full URL, comma
+    // separated in the env). The relay round-robins them per tunnel; a hop
+    // that refuses is avoided for cooldownMs. Empty means "just `hop`".
+    hops: parseList(ENV.WARP_PROXY_HOPS ?? ""),
     fallback: ENV.WARP_PROXY_FALLBACK ?? "direct",
     // auto: choose per request and switch when one path is refused.
     // always: pin the hop. off: never use the hop.
+    // warp-only: pin the hop and never fall back to direct — a dead hop
+    // fails the request (502/503) instead of leaking the host's address.
     mode: String(ENV.WARP_PROXY_MODE ?? "auto").trim().toLowerCase(),
     // How long a refused path is avoided before it may be tried again. The
     // bucket refills in tens of seconds, so a long avoidance only pins the
     // install to the other (possibly worse) exit.
     cooldownMs: Number(ENV.WARP_PROXY_COOLDOWN_MS ?? 60000),
+    // `warp-cli disconnect && warp-cli connect` rebuilds the WARP session, so
+    // the next tunnel usually leaves through a different exit address.
+    // Only ever run from the config — never from a request body.
+    rotateCommand: String(ENV.WARP_PROXY_ROTATE_COMMAND ?? "warp-cli --accept-tos disconnect && warp-cli --accept-tos connect"),
+    rotateCooldownMs: Number(ENV.WARP_PROXY_ROTATE_COOLDOWN_MS ?? 60000),
+    rotateTimeoutMs: Number(ENV.WARP_PROXY_ROTATE_TIMEOUT_MS ?? 90000),
+    // Off by default: rotating the exit on every refusal would churn the
+    // WARP session for a verdict that is usually the shared window, not the
+    // exit. When on, only an exit-specific refusal (403 FreeTierError, or a
+    // failed upstream connection) triggers one rotate — never a retry-after
+    // 429, which is the gateway-wide window and does not move with the IP.
+    autoRotateOnEgressReject: ENV.WARP_PROXY_AUTO_ROTATE_ON_EGRESS_REJECT === "1",
   },
   // A quota/gate refusal is a verdict on the account and the exit, never on the
   // model: report it after one account sweep (and at most one path switch)
@@ -378,24 +401,52 @@ const DEFAULT_CONFIG = {
 // back.
 let fallbackModelsPinned = false
 
+// One hop entry, in either spelling: "127.0.0.1:40000" or a full URL.
+function normalizeWarpHopEntry(v) {
+  const s = String(v ?? "").trim()
+  if (!s) return ""
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return s
+  return `http://${s}`
+}
+
+// The proxy hop is a nested block: a config file that only sets one of its
+// fields still needs the others, so normalise it field by field. `hops` wins
+// over the single `hop` when both are given; `hop` stays as the first entry
+// for the relay status and for installs that only ever had one hop.
+function normalizeWarpProxy(raw) {
+  const wp = raw && typeof raw === "object" ? raw : {}
+  const dflt = DEFAULT_CONFIG.warpProxy
+  const hops = (Array.isArray(wp.hops) ? wp.hops : parseList(wp.hops ?? ""))
+    .map(normalizeWarpHopEntry)
+    .filter(Boolean)
+  const hop = normalizeWarpHopEntry(wp.hop ?? "")
+  const list = [...new Set(hops.length ? hops : hop ? [hop] : [])]
+  const modeRaw = String(wp.mode ?? "auto").toLowerCase()
+  return {
+    enabled: Boolean(wp.enabled) && list.length > 0,
+    port: Number(wp.port) || dflt.port,
+    hop: list[0] ?? "",
+    hops: list,
+    fallback: wp.fallback === "none" ? "none" : "direct",
+    mode: ["auto", "always", "off", "warp-only"].includes(modeRaw) ? modeRaw : "auto",
+    cooldownMs: Math.max(10_000, Number(wp.cooldownMs) || dflt.cooldownMs),
+    rotateCommand: String(wp.rotateCommand ?? dflt.rotateCommand ?? "").trim() || dflt.rotateCommand,
+    rotateCooldownMs: Math.max(10_000, Number(wp.rotateCooldownMs) || dflt.rotateCooldownMs),
+    rotateTimeoutMs: Math.max(10_000, Number(wp.rotateTimeoutMs) || dflt.rotateTimeoutMs),
+    autoRotateOnEgressReject:
+      wp.autoRotateOnEgressReject === true ||
+      String(wp.autoRotateOnEgressReject ?? "").toLowerCase() === "true" ||
+      String(wp.autoRotateOnEgressReject ?? "") === "1",
+  }
+}
+
 function loadConfig() {
   try {
     const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
     const merged = { ...DEFAULT_CONFIG, ...raw }
     // The proxy hop is a nested block: a config file that only sets one of its
     // fields still needs the others, so merge it field by field.
-    merged.warpProxy = {
-      ...DEFAULT_CONFIG.warpProxy,
-      ...(raw.warpProxy && typeof raw.warpProxy === "object" ? raw.warpProxy : {}),
-    }
-    merged.warpProxy.port = Number(merged.warpProxy.port) || DEFAULT_CONFIG.warpProxy.port
-    merged.warpProxy.hop = String(merged.warpProxy.hop ?? "").trim()
-    merged.warpProxy.fallback = merged.warpProxy.fallback === "none" ? "none" : "direct"
-    merged.warpProxy.enabled = Boolean(merged.warpProxy.enabled && merged.warpProxy.hop)
-    merged.warpProxy.mode = ["auto", "always", "off"].includes(String(merged.warpProxy.mode ?? "").toLowerCase())
-      ? String(merged.warpProxy.mode).toLowerCase()
-      : "auto"
-    merged.warpProxy.cooldownMs = Math.max(10_000, Number(merged.warpProxy.cooldownMs) || DEFAULT_CONFIG.warpProxy.cooldownMs)
+    merged.warpProxy = normalizeWarpProxy(merged.warpProxy)
     // A config file that predates the models.json catalog still holds a list
     // written by an older build. Those are only ever subsets of what we shipped
     // (the runtime sync used to prune dead entries and save the result), so
@@ -1316,16 +1367,25 @@ const egressState = { active: "direct", unhealthyUntil: { direct: 0, warp: 0 }, 
 
 function egressMode() {
   const m = String(config.warpProxy?.mode ?? "auto").toLowerCase()
-  return m === "always" || m === "off" ? m : "auto"
+  return m === "always" || m === "off" || m === "warp-only" ? m : "auto"
 }
 function warpUsable() {
-  return Boolean(config.warpProxy?.enabled && config.warpProxy?.hop) && egressMode() !== "off"
+  return Boolean(config.warpProxy?.enabled) && warpHopList().length > 0 && egressMode() !== "off"
+}
+// Every configured hop, first entry first. `saveConfig` can hold a partial
+// warpProxy block (no `hops` key), so the single `hop` is the fallback.
+function warpHopList() {
+  const wp = config.warpProxy ?? {}
+  const hops = Array.isArray(wp.hops) ? wp.hops.map(normalizeWarpHopEntry).filter(Boolean) : []
+  if (hops.length) return [...new Set(hops)]
+  const hop = normalizeWarpHopEntry(wp.hop ?? "")
+  return hop ? [hop] : []
 }
 function relayProxyUrl() {
   return `http://127.0.0.1:${Number(config.warpProxy?.port) || 8890}`
 }
 function egressUsable(path) {
-  return path === "warp" ? warpUsable() : true
+  return path === "warp" ? warpUsable() : egressMode() !== "warp-only"
 }
 function otherEgress(path) {
   return path === "warp" ? "direct" : "warp"
@@ -1334,9 +1394,14 @@ function egressCooldownMs() {
   return Math.max(10_000, Number(config.warpProxy?.cooldownMs) || 300_000)
 }
 function initEgress() {
-  egressState.active = egressMode() === "always" && warpUsable() ? "warp" : "direct"
+  egressState.active = (egressMode() === "always" || egressMode() === "warp-only") && warpUsable() ? "warp" : "direct"
   egressState.switchedAt = Date.now()
-  egressState.reason = egressMode() === "off" ? "hop disabled" : `start on ${egressState.active}`
+  egressState.reason =
+    egressMode() === "off"
+      ? "hop disabled"
+      : egressMode() === "warp-only"
+        ? "warp-only: fail closed, never direct"
+        : `start on ${egressState.active}`
   egressState.bothRefusedUntil = 0
 }
 function egressFetch(url, init) {
@@ -1392,6 +1457,13 @@ function egressStatus() {
   return {
     mode: egressMode(),
     active: egressState.active,
+    // warp-only never takes the direct path: there is no "other path" to fall
+    // back to, so a dead hop fails the request instead of leaking the host IP.
+    failClosed: egressMode() === "warp-only",
+    hops: warpHopList(),
+    ip: egressIpState.ip || null,
+    ipCheckedAt: egressIpState.checkedAt ? new Date(egressIpState.checkedAt).toISOString() : null,
+    ipChangedAt: egressIpState.ipChangedAt ? new Date(egressIpState.ipChangedAt).toISOString() : null,
     healthy: {
       direct: egressState.unhealthyUntil.direct <= now,
       warp: warpUsable() && egressState.unhealthyUntil.warp <= now,
@@ -1410,6 +1482,189 @@ function egressStatus() {
 // The configured start path is applied once the egress helpers exist (the
 // config is loaded above, but `egressState` is a const declared in this block).
 initEgress()
+
+// ---- WARP exit address: probe and rotate -----------------------------------
+// The address upstream sees through the hop. It is only ever learned by
+// asking through the relay — never per request (one extra upstream call per
+// chat request would spend the free allowance), only when rotating, at
+// startup in warp-only mode, or when /api/status is asked with ?refresh=1.
+const egressIpState = { ip: "", checkedAt: 0, hop: "", ipChangedAt: 0 }
+
+function parseTraceIp(text) {
+  const m = String(text ?? "").match(/^ip=(.+)$/m)
+  return m ? m[1].trim() : ""
+}
+
+// Ask https://www.cloudflare.com/cdn-cgi/trace for the exit address, through
+// the relay (so the answer is the hop's exit, not the host's). Plain
+// node:http + node:net + node:tls: CONNECT the relay, TLS through the tunnel,
+// one GET. Works under Bun and Node alike — fetch has no per-request proxy
+// under Node, so it cannot do this.
+function probeEgressIpViaRelay(timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const relayPort = Number(config.warpProxy?.port) || 8890
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error("egress IP probe timed out"))
+    }, timeoutMs)
+    timer.unref?.()
+    const socket = net.connect({ host: "127.0.0.1", port: relayPort })
+    socket.once("error", (err) => {
+      clearTimeout(timer)
+      reject(new Error(`relay unreachable: ${err.message}`))
+    })
+    socket.once("connect", () => {
+      socket.write("CONNECT www.cloudflare.com:443 HTTP/1.1\r\nHost: www.cloudflare.com:443\r\n\r\n")
+    })
+    let buf = Buffer.alloc(0)
+    let tlsSocket = null
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      const end = buf.indexOf("\r\n\r\n")
+      if (end === -1) return
+      socket.removeListener("data", onData)
+      const head = buf.subarray(0, end).toString("latin1")
+      const status = Number(head.split(" ")[1] || 0)
+      if (status < 200 || status >= 300) {
+        clearTimeout(timer)
+        socket.destroy()
+        reject(new Error(`relay refused CONNECT (${status})`))
+        return
+      }
+      const rest = buf.subarray(end + 4)
+      tlsSocket = tls.connect({ socket, servername: "www.cloudflare.com" })
+      if (rest.length) tlsSocket.unshift(rest)
+      tlsSocket.once("error", (err) => {
+        clearTimeout(timer)
+        tlsSocket.destroy()
+        socket.destroy()
+        reject(new Error(`TLS to cloudflare.com failed: ${err.message}`))
+      })
+      tlsSocket.once("secureConnect", () => {
+        tlsSocket.write("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n")
+      })
+      const chunks = []
+      tlsSocket.on("data", (c) => chunks.push(c))
+      tlsSocket.once("end", () => {
+        clearTimeout(timer)
+        const body = Buffer.concat(chunks).toString("utf8")
+        const ip = parseTraceIp(body.split("\r\n\r\n").slice(1).join("\r\n\r\n") || body)
+        // The tunnel is done: tear both sockets down so the relay's
+        // server.close() is never left waiting on a lingering probe socket.
+        tlsSocket.destroy()
+        socket.destroy()
+        if (!ip) reject(new Error("cdn-cgi/trace answered without an ip="))
+        else resolve(ip)
+      })
+    }
+    socket.on("data", onData)
+  })
+}
+
+async function refreshEgressIp() {
+  const before = egressIpState.ip
+  const ip = await probeEgressIpViaRelay()
+  egressIpState.ip = ip
+  egressIpState.checkedAt = Date.now()
+  if (ip && ip !== before) egressIpState.ipChangedAt = Date.now()
+  return { ip, changed: ip !== before, previous: before || null }
+}
+
+const execFileP = promisify(execFile)
+const rotateState = { running: false, lastAt: 0, last: null }
+const DEFAULT_ROTATE_COMMAND = "warp-cli --accept-tos disconnect && warp-cli --accept-tos connect"
+
+function rotateCooldownMs() {
+  return Math.max(10_000, Number(config.warpProxy?.rotateCooldownMs) || 60_000)
+}
+function rotateTimeoutMs() {
+  return Math.max(10_000, Number(config.warpProxy?.rotateTimeoutMs) || 90_000)
+}
+function rotateCommand() {
+  return String(config.warpProxy?.rotateCommand || DEFAULT_ROTATE_COMMAND).trim() || DEFAULT_ROTATE_COMMAND
+}
+
+function rotateError(status, message, extra = {}) {
+  const err = new Error(message)
+  err.status = status
+  Object.assign(err, extra)
+  return err
+}
+
+// Rebuild the WARP session so the next tunnel usually leaves through a
+// different exit address. The command comes from the config only — a request
+// body can never supply one. Guarded by one lock and a cooldown; the IP is
+// probed before and after through the relay, best effort (a failed probe
+// leaves the IP unknown, it never fails the rotate itself).
+async function rotateWarpEgress() {
+  if (!warpUsable()) throw rotateError(503, "no warp hop configured — rotate needs a hop first")
+  if (rotateState.running) throw rotateError(409, "a rotate is already running")
+  const now = Date.now()
+  if (now - rotateState.lastAt < rotateCooldownMs()) {
+    throw rotateError(429, "rotate is cooling down", {
+      retryAfterSec: Math.ceil((rotateCooldownMs() - (now - rotateState.lastAt)) / 1000),
+    })
+  }
+  rotateState.running = true
+  try {
+    const before = await refreshEgressIp().catch(() => ({ ip: egressIpState.ip || null }))
+    const cmd = rotateCommand()
+    try {
+      const shell = process.platform === "win32" ? "cmd.exe" : "sh"
+      const shellArgs = process.platform === "win32" ? ["/d", "/s", "/c", cmd] : ["-c", cmd]
+      await execFileP(shell, shellArgs, { timeout: rotateTimeoutMs() })
+    } catch (err) {
+      const tail = String(err.stderr || err.stdout || err.message || err).trim().slice(-300)
+      throw rotateError(502, `rotate command failed: ${tail || "warp-cli error"}`)
+    }
+    // A fresh WARP session takes a moment before it carries tunnels.
+    await new Promise((r) => setTimeout(r, 2000))
+    let after = { ip: null }
+    for (let i = 0; i < 3; i++) {
+      try {
+        after = await refreshEgressIp()
+        break
+      } catch (err) {
+        // No relay at all will not heal by waiting; a refused CONNECT or a
+        // TLS failure right after a reconnect might.
+        if (/relay unreachable/.test(err.message)) break
+        if (i < 2) await new Promise((r) => setTimeout(r, 3000))
+      }
+    }
+    const result = {
+      ok: true,
+      ipBefore: before.ip || null,
+      ipAfter: after.ip || egressIpState.ip || null,
+      changed: Boolean(after.ip && before.ip && after.ip !== before.ip),
+      at: new Date().toISOString(),
+    }
+    rotateState.last = result
+    log(`warp rotate: ${result.ipBefore ?? "?"} → ${result.ipAfter ?? "?"}${result.changed ? "" : " (same or unknown)"}`)
+    return result
+  } finally {
+    // The cooldown runs from when the rotate finished, not when it started:
+    // a slow rotate (a reconnect plus three probes can take ~10s) must not
+    // leave the next one immediately allowed.
+    rotateState.lastAt = Date.now()
+    rotateState.running = false
+  }
+}
+
+// Opt-in automatic rotate, and only for an exit-specific refusal: a 403
+// FreeTierError or a failed upstream connection on the warp path. A
+// retry-after 429 is the gateway-wide window — the same on every exit — so
+// it never reaches this helper, and rotating there would only churn the
+// WARP session for nothing. Returns true when a rotate was started.
+function requestAutoRotate(reason) {
+  if (!config.warpProxy?.autoRotateOnEgressReject) return false
+  if (!warpUsable() || egressState.active !== "warp") return false
+  if (rotateState.running) return false
+  if (Date.now() - rotateState.lastAt < rotateCooldownMs()) return false
+  rotateWarpEgress()
+    .then((r) => log(`auto rotate (${reason}): ${r.ipBefore ?? "?"} → ${r.ipAfter ?? "?"}`))
+    .catch((err) => log(`auto rotate (${reason}) failed: ${err.message}`))
+  return true
+}
 
 // ---- the free window --------------------------------------------------------
 // The free allowance is per account/workspace, not per exit and not per key:
@@ -1878,6 +2133,7 @@ async function handleMessages(req, res) {
         if (wall) wall.release()
         lastErr = { error: { type: "api_error", message: err.message } }
         lastStatus = 502
+        if (egressState.active === "warp") requestAutoRotate("upstream connection failed")
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -1971,6 +2227,10 @@ async function handleMessages(req, res) {
       // A 403 FreeTierError stays model-level (a gated model can fall back to a
       // working one), so only the quota verdict short-circuits.
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
+      // Exit-specific refusal (403 FreeTierError): with the opt-in, rebuild the
+      // WARP session once so the next request leaves through a fresh exit.
+      // A quota 429 never reaches here as "gate" — its window is gateway-wide.
+      if (gateKind === "gate" && egressState.active === "warp") requestAutoRotate("exit refused (FreeTierError)")
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
         // A stated reset time is a hard window. Measured: every credential (four
@@ -2216,6 +2476,7 @@ async function handleChat(req, res, responsesRoute = false) {
         if (wall) wall.release()
         lastErr = { error: { type: "upstream_error", message: err.message } }
         lastStatus = 502
+        if (egressState.active === "warp") requestAutoRotate("upstream connection failed")
         if (attempt < retries) {
           delayMs = config.retryBackoffMs * (attempt + 1)
           continue
@@ -2339,6 +2600,10 @@ async function handleChat(req, res, responsesRoute = false) {
       // A 403 FreeTierError stays model-level (a gated model can fall back to a
       // working one), so only the quota verdict short-circuits.
       const gateKind = config.freeTierFastFail ? gateRefusalKind(lastStatus, lastErr) : ""
+      // Exit-specific refusal (403 FreeTierError): with the opt-in, rebuild the
+      // WARP session once so the next request leaves through a fresh exit.
+      // A quota 429 never reaches here as "gate" — its window is gateway-wide.
+      if (gateKind === "gate" && egressState.active === "warp") requestAutoRotate("exit refused (FreeTierError)")
       if (gateKind === "quota") {
         lastRetryAfter = Math.max(lastRetryAfter, parseRetryAfter(upstreamRes.headers.get("retry-after")))
         // A stated reset time is a hard window. Measured: every credential (four
@@ -3986,18 +4251,7 @@ async function handleApiConfig(req, res) {
       // The proxy hop is a nested block: keep the stored values for anything the
       // caller did not send, and normalise the fields the relay depends on.
       const incomingWarp = cleaned.warpProxy && typeof cleaned.warpProxy === "object" ? cleaned.warpProxy : {}
-      cleaned.warpProxy = {
-        ...config.warpProxy,
-        ...incomingWarp,
-        hop: String(incomingWarp.hop ?? config.warpProxy?.hop ?? "").trim(),
-        port: Number(incomingWarp.port ?? config.warpProxy?.port) || DEFAULT_CONFIG.warpProxy.port,
-        fallback: incomingWarp.fallback === "none" ? "none" : "direct",
-        mode: ["auto", "always", "off"].includes(String(incomingWarp.mode ?? config.warpProxy?.mode ?? "").toLowerCase())
-          ? String(incomingWarp.mode ?? config.warpProxy?.mode).toLowerCase()
-          : "auto",
-        cooldownMs: Math.max(10_000, Number(incomingWarp.cooldownMs ?? config.warpProxy?.cooldownMs) || DEFAULT_CONFIG.warpProxy.cooldownMs),
-      }
-      cleaned.warpProxy.enabled = Boolean(cleaned.warpProxy.enabled && cleaned.warpProxy.hop)
+      cleaned.warpProxy = normalizeWarpProxy({ ...config.warpProxy, ...incomingWarp })
       const warpChanged = JSON.stringify(cleaned.warpProxy) !== JSON.stringify(config.warpProxy)
       if (!Array.isArray(cleaned.fallbackModels)) cleaned.fallbackModels = config.fallbackModels
       // Saving from the dashboard is an explicit edit of the list, so from here on
@@ -4030,6 +4284,14 @@ async function handleApiConfig(req, res) {
 
 async function handleStatus(req, res) {
   if (!adminAuth(req, res)) return
+  // ?refresh=1 re-probes the exit address through the relay. Best effort: a
+  // failed probe leaves the last known IP in place and never fails /api/status.
+  try {
+    const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`)
+    if (url.searchParams.get("refresh") === "1" && warpUsable()) await refreshEgressIp()
+  } catch (err) {
+    log(`egress IP probe failed: ${err.message}`)
+  }
   const cache = await fetchModels()
   const now = Date.now()
   while (requestStats.window60.length && requestStats.window60[0] < now - 60_000) requestStats.window60.shift()
@@ -4348,6 +4610,7 @@ async function router(req, res) {
   if (p.startsWith("/api/")) {
     if (p === "/api/config") return handleApiConfig(req, res)
     if (p === "/api/status" && req.method === "GET") return handleStatus(req, res)
+    if (p === "/api/warp/rotate") return handleWarpRotate(req, res)
     if (p === "/api/test" && req.method === "POST") return handleTest(req, res)
     if (p === "/api/logs" && req.method === "GET") return handleLogs(req, res)
     if (p === "/api/sync" && req.method === "POST") {
@@ -4372,6 +4635,15 @@ async function router(req, res) {
   const isMessages = p === "/v1/messages" || p === "/messages"
   const isSystemone = p === SYSTEMONE_PATH || p === "/systemone"
   if (req.method === "POST" && (isInference || isMessages || isSystemone)) {
+    // warp-only never goes direct: check the relay will not fall back either.
+    // A dead hop or a relay started with --fallback direct answers 503 here,
+    // before any upstream call, so the host address never leaks.
+    if (egressMode() === "warp-only") {
+      const gate = await warpOnlyGate()
+      if (!gate.ok) {
+        return json(res, 503, { error: { type: "egress_unavailable", message: gate.reason } })
+      }
+    }
     // Throttle only the inference endpoints — the dashboard, /health and the
     // admin API must never be locked out by a client's burst.
     const rl = rateLimitFor(req)
@@ -4435,8 +4707,10 @@ function httpGetJson(url, timeoutMs = 2000) {
 async function relayStatus() {
   const wp = config.warpProxy ?? {}
   const base = {
-    enabled: Boolean(wp.enabled && wp.hop),
+    enabled: Boolean(wp.enabled) && warpHopList().length > 0,
     hop: String(wp.hop ?? ""),
+    hops: warpHopList(),
+    mode: egressMode(),
     fallback: wp.fallback ?? "direct",
     port: Number(wp.port ?? 0),
     proxyEnv: String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ""),
@@ -4444,9 +4718,59 @@ async function relayStatus() {
   if (!base.enabled) return { ...base, running: false }
   try {
     const data = await httpGetJson(`http://127.0.0.1:${base.port}/__status`)
-    return { ...base, running: true, ...data }
+    // The relay's per-hop counters are live; the config list is the fallback
+    // when the relay is an older build that does not report them.
+    return { ...base, running: true, ...data, hops: Array.isArray(data.hops) ? data.hops : base.hops }
   } catch {
     return { ...base, running: false }
+  }
+}
+
+// warp-only is fail closed, and the relay is a separate process: the only way
+// to know it will not fall back to a direct socket is to ask it. Cached for
+// a few seconds so an inference burst does not re-ask per request.
+const warpGateCache = { at: 0, ok: false, reason: "" }
+async function warpOnlyGate() {
+  const now = Date.now()
+  if (now - warpGateCache.at < 5000) return { ok: warpGateCache.ok, reason: warpGateCache.reason }
+  const port = Number(config.warpProxy?.port) || 8890
+  let ok = false
+  let reason = ""
+  try {
+    const data = await httpGetJson(`http://127.0.0.1:${port}/__status`, 2000)
+    if (data.fallback === "none") ok = true
+    else {
+      reason = `warp-only needs the relay started with --fallback none (relay reports fallback=${data.fallback}); restart it with WARP_ONLY=1 or use mode auto/always`
+    }
+  } catch (err) {
+    reason = `warp-only: relay at 127.0.0.1:${port} is not answering (${err.message}); refusing instead of leaking the direct IP`
+  }
+  warpGateCache.at = now
+  warpGateCache.ok = ok
+  warpGateCache.reason = reason
+  return { ok, reason }
+}
+
+function isLoopbackReq(req) {
+  const a = String(req.socket?.remoteAddress ?? "").replace(/^::ffff:/, "")
+  return a === "127.0.0.1" || a === "::1" || /^127\./.test(a)
+}
+
+// POST /api/warp/rotate — rebuild the WARP session and report the exit
+// before/after. Localhost only (rotating the exit is an operator action), and
+// proxyKey still applies when one is set.
+async function handleWarpRotate(req, res) {
+  if (!adminAuth(req, res)) return
+  if (!isLoopbackReq(req)) return json(res, 403, { error: "rotate is localhost-only" })
+  if (req.method !== "POST") return json(res, 405, { error: "method not allowed" })
+  try {
+    const out = await rotateWarpEgress()
+    return json(res, 200, { ok: true, ...out })
+  } catch (err) {
+    return json(res, err.status ?? 502, {
+      error: err.message,
+      ...(err.retryAfterSec ? { retryAfterSec: err.retryAfterSec } : {}),
+    })
   }
 }
 
@@ -4498,7 +4822,9 @@ if (isMain) {
     // silently pin every call again — say so instead of looking adaptive.
     const status = egressStatus()
     if (status.mode === "off") log("egress: direct only (hop disabled)")
-    else if (!warpUsable()) log(`egress: ${status.active} (no hop configured)`)
+    else if (status.mode === "warp-only") {
+      log(`egress: warp-only (fail closed, relay ${status.relay}); a dead hop answers 503, never direct`)
+    } else if (!warpUsable()) log(`egress: ${status.active} (no hop configured)`)
     else log(`egress: ${status.active} of direct|warp (mode ${status.mode}, relay ${status.relay})`)
     const proxyEnv = String(process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "")
     if (proxyEnv) {
@@ -4569,12 +4895,26 @@ export {
   egressFetch,
   egressUsable,
   warpUsable,
+  warpHopList,
+  normalizeWarpProxy,
+  normalizeWarpHopEntry,
   gateRefusalKind,
   canSwitchEgress,
   switchEgress,
   noteEgressRefusal,
   noteEgressSuccess,
   initEgress,
+  // WARP exit address: probe and rotate
+  egressIpState,
+  parseTraceIp,
+  probeEgressIpViaRelay,
+  refreshEgressIp,
+  rotateState,
+  rotateWarpEgress,
+  requestAutoRotate,
+  rotateCooldownMs,
+  handleWarpRotate,
+  warpOnlyGate,
   keyBlocks,
   // free window
   quotaState,

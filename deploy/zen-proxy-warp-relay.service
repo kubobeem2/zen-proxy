@@ -1,6 +1,9 @@
 [Unit]
 Description=Zen Proxy WARP relay (HTTP CONNECT relay with a direct fallback)
 Documentation=https://github.com/12errh/zen-proxy
+# Several hops: --hops http://127.0.0.1:40000,http://127.0.0.1:40001 (the
+# relay round-robins them per tunnel). Fail closed: --fallback none, which is
+# what warp-only mode requires — a dead hop then answers 502, never direct.
 After=network-online.target warp-svc.service
 Wants=network-online.target
 

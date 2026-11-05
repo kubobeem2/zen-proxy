@@ -31,7 +31,7 @@ async function loadWarpProxy(configFile) {
   const script = `
     const zp = await import(${JSON.stringify(MODULE_URL)})
     const status = await zp.relayStatus()
-    process.stdout.write(JSON.stringify({ warpProxy: zp.config.warpProxy, status }))
+    process.stdout.write(JSON.stringify({ warpProxy: zp.config.warpProxy, status, egress: zp.egressStatus() }))
   `
   const { stdout } = await run(process.execPath, ["--input-type=module", "-e", script], {
     env: { ...process.env, ZEN_PROXY_CONFIG: configFile },
@@ -101,5 +101,55 @@ describe("proxy hop configuration", () => {
     })
     const out = await loadWarpProxy(file)
     assert.equal(out.warpProxy.port, 8899)
+  })
+
+  test("mode warp-only is kept and pins the hop", async () => {
+    const file = writeConfig(tmpDir(), {
+      port: 8799,
+      warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", port: NO_RELAY_PORT, mode: "warp-only" },
+    })
+    const out = await loadWarpProxy(file)
+    assert.equal(out.warpProxy.mode, "warp-only")
+    assert.equal(out.status.mode, "warp-only")
+    assert.equal(out.egress.active, "warp")
+    assert.equal(out.egress.failClosed, true)
+    assert.equal(out.egress.mode, "warp-only")
+  })
+
+  test("an unknown mode falls back to auto", async () => {
+    const file = writeConfig(tmpDir(), {
+      port: 8799,
+      warpProxy: { enabled: true, hop: "http://127.0.0.1:40000", mode: "pinned" },
+    })
+    const out = await loadWarpProxy(file)
+    assert.equal(out.warpProxy.mode, "auto")
+  })
+
+  test("several hops normalise to full URLs, first one stays `hop`", async () => {
+    const file = writeConfig(tmpDir(), {
+      port: 8799,
+      warpProxy: {
+        enabled: true,
+        hops: ["127.0.0.1:40000", "http://127.0.0.1:40001", "127.0.0.1:40000"],
+        port: NO_RELAY_PORT,
+      },
+    })
+    const out = await loadWarpProxy(file)
+    assert.deepEqual(out.warpProxy.hops, ["http://127.0.0.1:40000", "http://127.0.0.1:40001"])
+    assert.equal(out.warpProxy.hop, "http://127.0.0.1:40000")
+    assert.equal(out.warpProxy.enabled, true)
+    assert.deepEqual(out.status.hops, ["http://127.0.0.1:40000", "http://127.0.0.1:40001"])
+  })
+
+  test("rotate defaults are present and auto-rotate is off", async () => {
+    const file = writeConfig(tmpDir(), {
+      port: 8799,
+      warpProxy: { enabled: true, hop: "http://127.0.0.1:40000" },
+    })
+    const out = await loadWarpProxy(file)
+    assert.equal(out.warpProxy.rotateCommand, "warp-cli --accept-tos disconnect && warp-cli --accept-tos connect")
+    assert.equal(out.warpProxy.rotateCooldownMs, 60000)
+    assert.equal(out.warpProxy.rotateTimeoutMs, 90000)
+    assert.equal(out.warpProxy.autoRotateOnEgressReject, false)
   })
 })

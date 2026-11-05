@@ -470,6 +470,7 @@ textarea { resize:vertical; min-height:96px; font-family:var(--mono); font-size:
       <select id="cfgWarpMode" style="width:100%">
         <option value="auto">Auto — start direct, switch path when one is refused</option>
         <option value="always">Always — pin the WARP hop</option>
+        <option value="warp-only">Warp-only — pin the hop, never fall back to direct (fail closed)</option>
         <option value="off">Off — direct only</option>
       </select>
       <div class="checkbox"><input type="checkbox" id="cfgRateLimit"><span>Rate-limit chat requests per client (0 = off)</span></div>
@@ -819,8 +820,12 @@ async function populateConfigForm() {
     $("cfgDefault").placeholder = eff ? "auto → " + st.effectiveDefault : "(auto)"
     $("cfgAuth").textContent = "auth: " + modeLabel + (auth.zenKey ? " (" + auth.zenKey + ")" : "") + eff
     const warp = st.warp || {}
+    const hopList = Array.isArray(warp.hops) && warp.hops.length && typeof warp.hops[0] === "object"
+      ? warp.hops.map((h) => h.hop + (h.healthy ? "" : " (cooling " + (h.avoidForSec ?? 0) + "s)")).join(", ")
+      : (warp.hops || []).join(", ")
     $("cfgWarp").textContent = warp.enabled
       ? "hop: " + (warp.hop || "(unset)") +
+        (hopList && hopList !== (warp.hop || "") ? " · hops: " + hopList : "") +
         " · relay " + (warp.running ? "up" : "down") +
         " · tunnels " + (warp.tunnels ?? 0) +
         " (hop " + (warp.viaHop ?? 0) + " / direct " + (warp.viaDirect ?? 0) + " / fallbacks " + (warp.fallbacks ?? 0) + ")"
@@ -832,9 +837,10 @@ async function populateConfigForm() {
     const eg = st.egress || {}
     $("cfgEgress").textContent = eg.active
       ? "egress: " + eg.active +
-        " (mode " + eg.mode + ")" +
+        " (mode " + eg.mode + (eg.failClosed ? ", fail closed" : "") + ")" +
         " · direct " + (eg.healthy?.direct ? "ok" : "avoided " + (eg.avoidForSec?.direct ?? 0) + "s") +
         " · warp " + (!eg.healthy?.warp && eg.avoidForSec?.warp ? "avoided " + eg.avoidForSec.warp + "s" : eg.healthy?.warp ? "ok" : "off") +
+        " · exit ip " + (eg.ip || "?") +
         (eg.reason ? " · " + eg.reason : "")
       : "egress: unknown"
     const q = st.quota || {}

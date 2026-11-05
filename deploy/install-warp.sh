@@ -4,6 +4,18 @@
 #   sudo bash deploy/install-warp.sh            # install
 #   sudo bash deploy/install-warp.sh --remove   # undo
 #
+# Env knobs:
+#   WARP_ONLY=1            install fail-closed: the relay runs with
+#                          --fallback none and zen-proxy with
+#                          WARP_PROXY_MODE=warp-only, so a dead hop answers
+#                          503 instead of leaking the host's own address.
+#                          Needs a second warp-cli instance per extra hop.
+#   WARP_PROXY_HOPS="http://127.0.0.1:40000,http://127.0.0.1:40001"
+#                          extra hops for the relay to round-robin. Each hop
+#                          is one warp-cli instance in proxy mode on its own
+#                          port; a hop that refuses is avoided for a minute.
+#                          One hop is the default (WARP_PROXY_PORT).
+#
 # What --install does:
 #   1. installs the official cloudflare-warp package (apt, trixie/bookworm/bullseye)
 #   2. registers a free WARP device and puts the client in proxy mode
@@ -19,6 +31,19 @@ REPO_DIR="${REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 RELAY_PORT="${RELAY_PORT:-8890}"
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
 HOP="http://127.0.0.1:${WARP_PROXY_PORT}"
+# All hops, comma separated. One hop by default; a second warp-cli instance in
+# proxy mode (its own port, e.g. 40001) adds a second exit to round-robin.
+HOPS="${WARP_PROXY_HOPS:-$HOP}"
+# Fail-closed install: no direct socket anywhere. A dead hop then answers 502
+# at the relay and 503 at zen-proxy instead of leaking the host's address.
+WARP_ONLY="${WARP_ONLY:-0}"
+if [ "$WARP_ONLY" = "1" ]; then
+  FALLBACK="none"
+  MODE="warp-only"
+else
+  FALLBACK="direct"
+  MODE="${WARP_PROXY_MODE:-auto}"
+fi
 RELAY_URL="http://127.0.0.1:${RELAY_PORT}"
 
 info() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -90,12 +115,24 @@ warp-cli --accept-tos status 2>&1 | sed 's/^/  /'
 
 echo "== 3. relay unit + zen-proxy drop-in =="
 $SUDO mkdir -p /etc/systemd/system/zen-proxy.service.d
-sed -e "s|--port 8890|--port ${RELAY_PORT}|" -e "s|--hop http://127.0.0.1:40000|--hop ${HOP}|" \
+# One hop keeps --hop; several become --hops (the relay round-robins them).
+if [[ "$HOPS" == *,* ]]; then
+  HOP_ARG="--hops ${HOPS}"
+else
+  HOP_ARG="--hop ${HOPS}"
+fi
+sed -e "s|--port 8890|--port ${RELAY_PORT}|" \
+  -e "s|--hop http://127.0.0.1:40000|${HOP_ARG}|" \
+  -e "s|--fallback direct|--fallback ${FALLBACK}|" \
   "$REPO_DIR/deploy/zen-proxy-warp-relay.service" \
   | $SUDO tee /etc/systemd/system/zen-proxy-warp-relay.service >/dev/null
 sed -e "s|http://127.0.0.1:40000|${HOP}|g" \
+  -e "s|^Environment=WARP_PROXY_MODE=auto|Environment=WARP_PROXY_MODE=${MODE}|" \
   "$REPO_DIR/deploy/zen-proxy.service.d/warp-proxy.conf" \
   | $SUDO tee /etc/systemd/system/zen-proxy.service.d/warp-proxy.conf >/dev/null
+if [[ "$HOPS" == *,* ]]; then
+  echo "Environment=WARP_PROXY_HOPS=${HOPS}" | $SUDO tee -a /etc/systemd/system/zen-proxy.service.d/warp-proxy.conf >/dev/null
+fi
 
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable --now zen-proxy-warp-relay
@@ -112,4 +149,8 @@ printf "  exit through the relay: "; curl -s --max-time 30 -x "${RELAY_URL}" htt
 printf "  zen-proxy health: "; curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 http://127.0.0.1:8787/health
 echo
 info "Done. The upstream now leaves the host through WARP; /api/status reports the hop."
+if [ "$WARP_ONLY" = "1" ]; then
+  info "Fail-closed (warp-only): a dead hop answers 503, never direct. Rotate the exit with:"
+  info "  curl -s -X POST http://127.0.0.1:8787/api/warp/rotate"
+fi
 info "Undo: sudo bash deploy/install-warp.sh --remove"
